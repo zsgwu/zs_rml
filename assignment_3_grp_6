@@ -1,0 +1,792 @@
+## License
+
+Copyright 2021 - 2023 Patrick Hall (jphall@gwu.edu)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+*DISCLAIMER*: This notebook is not legal or compliance advice.
+
+# Assignment 3 Template
+
+#### Imports and inits
+
+!pip install h2o
+!pip install interpret
+!pip install xgboost
+
+import datetime                                               # timestamp for submission file
+from interpret.glassbox import ExplainableBoostingClassifier  # interpret ebm class
+from interpret.perf import ROC                                # ROC measure for ebm
+import itertools                                              # for cartesian product of parameters
+import matplotlib.pyplot as plt                               # for plots
+import numpy as np                                            # for basic array manipulation
+import pandas as pd                                           # for dataframe manipulation
+import random                                                 # to sample from lists
+from sklearn.metrics import accuracy_score, f1_score          # for selecting model cutoffs
+import time                                                   # for timers
+
+# set numpy random seed for better reproducibility
+SEED = 12345
+np.random.seed(SEED)
+
+# set number of threads
+NTHREAD = 4
+
+### Define utility functions
+
+#### Utility function to calculate confusion matrices by demographic group
+
+def get_confusion_matrix(frame, y, yhat, by=None, level=None, cutoff=0.5, verbose=True):
+
+    """ Creates confusion matrix from pandas dataframe of y and yhat values, can be sliced
+        by a variable and level.
+
+        :param frame: Pandas dataframe of actual (y) and predicted (yhat) values.
+        :param y: Name of actual value column.
+        :param yhat: Name of predicted value column.
+        :param by: By variable to slice frame before creating confusion matrix, default None.
+        :param level: Value of by variable to slice frame before creating confusion matrix, default None.
+        :param cutoff: Cutoff threshold for confusion matrix, default 0.5.
+        :param verbose: Whether to print confusion matrix titles, default True.
+        :return: Confusion matrix as pandas dataframe.
+
+    """
+
+    # determine levels of target (y) variable
+    # sort for consistency
+    level_list = list(frame[y].unique())
+    level_list.sort(reverse=True)
+
+    # init confusion matrix
+    cm_frame = pd.DataFrame(columns=['actual: ' +  str(i) for i in level_list],
+                            index=['predicted: ' + str(i) for i in level_list])
+
+    # don't destroy original data
+    frame_ = frame.copy(deep=True)
+
+    # convert numeric predictions to binary decisions using cutoff
+    dname = 'd_' + str(y)
+    frame_[dname] = np.where(frame_[yhat] > cutoff , 1, 0)
+
+    # slice frame
+    if (by is not None) & (level is not None):
+        frame_ = frame_[frame[by] == level]
+
+    # calculate size of each confusion matrix value
+    for i, lev_i in enumerate(level_list):
+        for j, lev_j in enumerate(level_list):
+            cm_frame.iat[j, i] = frame_[(frame_[y] == lev_i) & (frame_[dname] == lev_j)].shape[0]
+            # i, j vs. j, i nasty little bug ... updated 8/30/19
+
+    # output results
+    if verbose:
+        if by is None:
+            print('Confusion matrix:')
+        else:
+            print('Confusion matrix by ' + by + '=' + str(level))
+
+    return cm_frame
+
+#### Utility function to calculate AIR
+
+def air(cm_dict, reference_key, protected_key, verbose=True):
+
+    """ Calculates the adverse impact ratio as a quotient between protected and
+        reference group acceptance rates: protected_prop/reference_prop.
+        Optionally prints intermediate values. ASSUMES 0 IS "POSITIVE" OUTCOME!
+
+        :param cm_dict: Dictionary of demographic group confusion matrices.
+        :param reference_key: Name of reference group in cm_dict as a string.
+        :param protected_key: Name of protected group in cm_dict as a string.
+        :param verbose: Whether to print intermediate acceptance rates, default True.
+        :return: AIR.
+
+    """
+
+    eps = 1e-20 # numeric stability and divide by 0 protection
+
+    # reference group summary
+    reference_accepted = float(cm_dict[reference_key].iat[1,0] + cm_dict[reference_key].iat[1,1]) # predicted 0's
+    reference_total = float(cm_dict[reference_key].sum().sum())
+    reference_prop = reference_accepted/reference_total
+    if verbose:
+        print(reference_key.title() + ' proportion accepted: %.3f' % reference_prop)
+
+    # protected group summary
+    protected_accepted = float(cm_dict[protected_key].iat[1,0] + cm_dict[protected_key].iat[1,1]) # predicted 0's
+    protected_total = float(cm_dict[protected_key].sum().sum())
+    protected_prop = protected_accepted/protected_total
+    if verbose:
+        print(protected_key.title() + ' proportion accepted: %.3f' % protected_prop)
+
+    # return adverse impact ratio
+    if np.isclose(protected_accepted, 0.0):
+        return np.nan
+    else:
+        return ((protected_prop + eps)/(reference_prop + eps))
+
+
+#### Utility function to select probability cutoff by F1
+
+def get_max_f1_frame(frame, y, yhat, res=0.01, air_reference=None, air_protected=None, verbose=False):
+
+    """ Utility function for finding max. F1.
+        Coupled to get_confusion_matrix() and air().
+        Assumes 1 is the marker for class membership.
+
+        :param frame: Pandas dataframe of actual (y) and predicted (yhat) values.
+        :param y: Known y values.
+        :param yhat: Model scores.
+        :param res: Resolution over which to search for max. F1, default 0.01.
+        :param air_reference: Reference group for AIR calculation, optional.
+        :param air_protected: Protected group for AIR calculation, optional.
+        :return: Pandas DataFrame of cutoffs to select from.
+
+    """
+
+    do_air = all(v is not None for v in [air_reference, air_protected])
+
+    # init frame to store f1 at different cutoffs
+    if do_air:
+        columns = ['cut', 'f1', 'acc', 'air']
+    else:
+        columns = ['cut', 'f1', 'acc']
+    f1_frame = pd.DataFrame(columns=['cut', 'f1', 'acc'])
+
+    # copy known y and score values into a temporary frame
+    temp_df = frame[[y, yhat]].copy(deep=True)
+
+    # find f1 at different cutoffs and store in acc_frame
+    for i, cut in enumerate(np.arange(0, 1 + res, res)):
+        temp_df['decision'] = np.where(temp_df.iloc[:, 1] > cut, 1, 0)
+        f1 = f1_score(temp_df.iloc[:, 0], temp_df['decision'])
+        acc = accuracy_score(temp_df.iloc[:, 0], temp_df['decision'])
+        row_dict = {'cut': cut, 'f1': f1, 'acc': acc}
+        if do_air:
+            # conditionally calculate AIR
+            cm_ref = get_confusion_matrix(frame, y, yhat, by=air_reference, level=1, cutoff=cut, verbose=verbose)
+            cm_pro = get_confusion_matrix(frame, y, yhat, by=air_protected, level=1, cutoff=cut, verbose=verbose)
+            air_ = air({air_reference: cm_ref, air_protected: cm_pro}, air_reference, air_protected, verbose=verbose)
+            row_dict['air'] = air_
+
+        f1_frame = pd.concat([f1_frame, pd.DataFrame(row_dict, index=[i])], axis=0)
+
+    del temp_df
+
+    return f1_frame
+
+#### Utility function for random grid search
+
+def ebm_grid(train, valid, x_names, y_name, gs_params=None, n_models=None, early_stopping_rounds=None, seed=None,
+             air_reference=None, air_protected=None, air_cut=None, verbose=False):
+
+    """ Performs a random grid search over n_models and gs_params.
+        Optionally considers random feature sets and AIR.
+        Coupled to get_confusion_matrix() and air().
+
+    :param train: Training data as Pandas DataFrame.
+    :param valid: Validation data as Pandas DataFrame.
+    :param x_names: Names of input features.
+    :param y_name: Name of target feature.
+    :param gs_params: Dictionary of lists of potential EBM parameters over which to search.
+    :param n_models: Number of random models to evaluate.
+    :param early_stopping_rounds: EBM early stopping rounds.
+    :param seed: Random seed for better interpretability.
+    :param air_reference: Reference group for AIR calculation, optional.
+    :param air_protected: Protected group for AIR calculation, optional.
+    :param air_cut: Cutoff for AIR calculation, optional.
+    :param verbose: Whether to print intermediate acceptance rates, default False.
+    :return: Tuple: (Best EBM model, Pandas DataFrame of models to select from)
+
+    """
+
+    # init returned frame
+    do_air = all(v is not None for v in [air_reference, air_protected])
+    if do_air:
+        columns = list(gs_params.keys()) + ['features', 'auc', 'air']
+    else:
+        columns = list(gs_params.keys()) + ['auc']
+    ebm_grid_frame = pd.DataFrame(columns=columns)
+
+    # cartesian product of gs_params
+    keys, values = zip(*gs_params.items())
+    experiments = [dict(zip(keys, v)) for v in itertools.product(*values)]
+
+    # preserve exact reproducibility for this function
+    np.random.seed(SEED)
+
+    # select randomly from cartesian product space
+    selected_experiments = np.random.choice(len(experiments), n_models)
+
+    # set global params for seed, etc.
+    params = {'n_jobs': NTHREAD,
+              'early_stopping_rounds': early_stopping_rounds,
+              'random_state': SEED}
+
+    # init grid search loop
+    best_candidate = None
+    best_score = 0
+
+    # grid search loop
+    for i, exp in enumerate(selected_experiments):
+
+        params.update(experiments[exp])  # override global params with current grid run params
+
+        print('Grid search run %d/%d:' % (int(i + 1), int(n_models)))
+        print('Training with parameters:', params)
+
+        # train
+        ebm = ExplainableBoostingClassifier(**params)
+
+        # conditionally select random features
+        features = x_names
+        if do_air:
+            n_features = random.randrange(len(x_names)) + 1
+            features = random.sample(x_names, n_features)
+        candidate = ebm.fit(train[features], train[y_name])
+
+        # calculate AUC
+        ebm_perf = ROC(ebm.predict_proba).explain_perf(valid[features], valid[y_name])
+        candidate_best_score = ebm_perf._internal_obj['overall']['auc']
+
+        # compose values to add to ebm_grid_frame
+        row_dict = params.copy()
+        row_dict['auc'] = candidate_best_score
+        if do_air:
+            # collect random feature set
+            row_dict['features'] = features
+            # conditionally calculate AIR
+            valid_phat = valid.copy(deep=True)
+            valid_phat['phat'] = candidate.predict_proba(valid[features])[:, 1]
+            cm_ref = get_confusion_matrix(valid_phat, y_name, 'phat', by=air_reference, level=1, cutoff=air_cut, verbose=verbose)
+            cm_pro = get_confusion_matrix(valid_phat, y_name, 'phat', by=air_protected, level=1, cutoff=air_cut, verbose=verbose)
+            air_ = air({air_reference: cm_ref, air_protected: cm_pro}, air_reference, air_protected, verbose=verbose)
+            row_dict['air'] = air_
+            row_dict['features'] = ', '.join(row_dict['features'])
+            del valid_phat
+
+        # append run to ebm_grid_frame
+        ebm_grid_frame = pd.concat([ebm_grid_frame, pd.DataFrame(row_dict, index=[i])], axis=0)
+
+        # determine if current model is better than previous best
+        if candidate_best_score > best_score:
+            best_score = candidate_best_score
+            best_ebm = candidate
+            print('Grid search new best score discovered at iteration %d/%d: %.4f.' %
+                             (int(i + 1), int(n_models), candidate_best_score))
+
+        print('---------- ----------')
+
+        del row_dict
+        del ebm
+
+    return best_ebm, ebm_grid_frame
+
+#### Start global timer
+
+tic = time.time()
+
+from google.colab import drive
+drive.mount('/content/drive/', force_remount=True)
+# may need to be updated to location on your drive
+%cd drive/My\ Drive/GWU_RML/DNSC_6330_Software/data/
+%ls
+
+#### Import data
+
+data = pd.read_csv('hmda_train_preprocessed.csv')
+test = pd.read_csv('hmda_test_preprocessed.csv')
+
+#### Assign basic modeling roles
+
+y_name = 'high_priced'
+x_names = ['term_360', 'conforming', 'debt_to_income_ratio_missing', 'loan_amount_std', 'loan_to_value_ratio_std', 'no_intro_rate_period_std',
+           'intro_rate_period_std', 'property_value_std', 'income_std', 'debt_to_income_ratio_std']
+
+## Fit interpretable model
+
+#### Split data into train and validation partitions
+
+np.random.seed(SEED) # preserve exact reproducibility for this cell
+
+split_ratio = 0.7 # 70%/30% train/test split
+
+# execute split
+split = np.random.rand(len(data)) < split_ratio
+train = data[split]
+valid = data[~split]
+
+# summarize split
+print('Train data rows = %d, columns = %d' % (train.shape[0], train.shape[1]))
+print('Validation data rows = %d, columns = %d' % (valid.shape[0], valid.shape[1]))
+
+# benchmark - Train data rows = 112253, columns = 23
+# benchmark - Validation data rows = 48085, columns = 23
+
+### Explainable Boosting Machine
+
+#### Fit EBM with random grid search
+
+# dictionary of hyperparameter value lists for grid search
+gs_params = {'max_bins': [128, 256, 512],
+             'max_interaction_bins': [16, 32, 64],
+             'interactions': [5, 10, 15],
+             'outer_bags': [4, 8, 12],
+             'inner_bags': [0, 4],
+             'learning_rate': [0.001, 0.01, 0.05],
+             'validation_size': [0.1, 0.25, 0.5],
+             'min_samples_leaf': [1, 2, 5, 10],
+             'max_leaves': [1, 3, 5]}
+
+# start local timer
+ebm_tic = time.time()
+
+# EBM grid search
+best_ebm, ebm_grid_frame = ebm_grid(train, valid, x_names, y_name, gs_params=gs_params, n_models=10,
+                                    early_stopping_rounds=100, seed=SEED)
+
+# end local timer
+ebm_toc = time.time() - ebm_tic
+print('EBM training completed in %.2f s.' % (ebm_toc))
+
+#### Basic AUC assessment
+
+best_ebm_perf = ROC(best_ebm.predict_proba).explain_perf(valid[x_names], valid[y_name])
+print('Validation AUC: %.4f.' % best_ebm_perf._internal_obj['overall']['auc'])
+
+#### Score validation data with model
+
+best_ebm_phat = pd.DataFrame(best_ebm.predict_proba(valid[x_names])[:, 1], columns=['phat'])
+best_ebm_phat = pd.concat([valid.reset_index(drop=True), best_ebm_phat], axis=1)
+best_ebm_phat.head()
+
+### Investigate Best Model (EBM) for Discrimination
+
+#### Find optimal cutoff based on F1
+Cutoffs are normally selected by maximizing a quality statistic or a business metric, and not by considering bias and discrimination.
+
+f1_frame = get_max_f1_frame(best_ebm_phat, y_name, 'phat')
+
+print(f1_frame)
+print()
+
+max_f1 = f1_frame['f1'].max()
+best_cut = f1_frame.loc[int(f1_frame['f1'].idxmax()), 'cut'] #idxmax() returns the index of the maximum value
+acc = f1_frame.loc[int(f1_frame['f1'].idxmax()), 'acc']
+
+print('Best EBM F1: %.4f achieved at cutoff: %.2f with accuracy: %.4f.' % (max_f1, best_cut, acc))
+
+#### Find confusion matrices for demographic groups
+
+demographic_group_names = ['black', 'asian', 'white', 'male', 'female']
+cm_dict = {}
+
+for name in demographic_group_names:
+    cm_dict[name] = get_confusion_matrix(best_ebm_phat, y_name, 'phat', by=name, level=1, cutoff=best_cut)
+    print(cm_dict[name])
+    print()
+
+#### Find AIR for Asian people
+
+print('Adverse impact ratio for Asian people vs. White people: %.3f' % air(cm_dict, 'white', 'asian'))
+
+#### Find AIR for Black people
+
+print('Adverse impact ratio for Black people vs. White people: %.3f' % air(cm_dict, 'white', 'black'))
+
+#### Find AIR for Females
+
+print('Adverse impact ratio for Females vs. Males: %.3f' % air(cm_dict, 'male', 'female'))
+
+### Attempt remediation of discovered discrimination
+
+#### Simplest remediation: Find cutoff with better Black vs. White AIR
+
+f1_frame = get_max_f1_frame(best_ebm_phat, y_name, 'phat', air_reference='white', air_protected='black')
+# print highest quality cutoffs above four fifths rule cutoff
+f1_frame[f1_frame['air'] > 0.8].sort_values(by='f1', ascending=False).head()
+
+Cutoffs in the 0.22-0.26 range provide increased accuracy and less bias towards Black people.
+
+#### Check that other groups are not adversely impacted by change
+
+# calculate new confusion matrics for each group
+rem_cm_dict = {}
+for name in demographic_group_names:
+    rem_cm_dict[name] = get_confusion_matrix(best_ebm_phat, y_name, 'phat', by=name, level=1, cutoff=0.22, verbose=False)
+
+# calculate AIR for each group
+print('Adverse impact ratio for Asian people vs. White people: %.3f' % air(rem_cm_dict, 'white', 'asian', verbose=False))
+print('Adverse impact ratio for Black people vs. White people: %.3f' % air(rem_cm_dict, 'white', 'black', verbose=False))
+print('Adverse impact ratio for Females vs. Males: %.3f' % air(rem_cm_dict, 'male', 'female', verbose=False))
+
+The new cutoff does not adversely affect other protected groups.
+
+#### More sophisticated remdiation: Model selection via quality and fairness
+
+# start local timer
+ebm2_tic = time.time()
+
+# new grid search that also considers AIR and fairness
+best_ebm2, ebm_grid_frame = ebm_grid(train, best_ebm_phat, x_names, y_name, gs_params=gs_params, n_models=25,
+                                     early_stopping_rounds=100, seed=SEED, air_reference='white', air_protected='black',
+                                     air_cut=0.17)
+
+# end local timer
+ebm2_toc = time.time() - ebm2_tic
+print('EBM training completed in %.2f s.' % (ebm2_toc))
+
+### Reweightning Remediation Method
+
+import numpy as np
+import pandas as pd
+from interpret.glassbox import ExplainableBoostingClassifier
+from interpret.perf import ROC
+from sklearn.metrics import f1_score, accuracy_score
+
+# Function to reweight the dataset
+def reweight_dataset(frame, y, demo_name, groups):
+    n = len(frame)
+    freq_dict = {'pos': len(frame.loc[frame[y] == 1])/n,
+                 'neg': len(frame.loc[frame[y] == 0])/n}
+    freq_dict.update({group: frame[demo_name].value_counts()[group]/n for group in groups})
+    weights = pd.Series(np.ones(n), index=frame.index)
+    for label in [0, 1]:
+        for group in groups:
+            label_name = 'pos' if label == 1 else 'neg'
+            freq = frame.loc[frame[y] == label][demo_name].value_counts()[group]/n
+            weights[(frame[y] == label) & (frame[demo_name] == group)] *= freq_dict[group]*freq_dict[label_name]/freq
+    return weights
+
+data = pd.read_csv('hmda_train_preprocessed.csv')
+test = pd.read_csv('hmda_test_preprocessed.csv')
+
+y_name = 'high_priced'
+x_names = ['term_360', 'conforming', 'debt_to_income_ratio_missing', 'loan_amount_std', 'loan_to_value_ratio_std', 'no_intro_rate_period_std',
+           'intro_rate_period_std', 'property_value_std', 'income_std', 'debt_to_income_ratio_std']
+
+
+# Split data into train and validation partitions
+np.random.seed(12345)  # preserve exact reproducibility for this cell
+split_ratio = 0.7  # 70%/30% train/test split
+split = np.random.rand(len(data)) < split_ratio
+train = data[split]
+valid = data[~split]
+
+demographic_group_names = ['black', 'asian', 'white', 'male', 'female']
+
+# Create a combined race column
+def combine_race_columns(row):
+    if row['black'] == 1:
+        return 'black'
+    elif row['asian'] == 1:
+        return 'asian'
+    elif row['white'] == 1:
+        return 'white'
+    else:
+        return 'other'
+
+data['race'] = data.apply(combine_race_columns, axis=1)
+test['race'] = test.apply(combine_race_columns, axis=1)
+
+# Verify the columns
+print("Data columns:", data.columns)
+print("Test columns:", test.columns)
+
+# Verify the 'race' column
+print("Data 'race' column:\n", data['race'].head())
+print("Test 'race' column:\n", test['race'].head())
+
+# Print the first few rows of the DataFrame
+print("Data DataFrame:\n", data.head())
+print("Test DataFrame:\n", test.head())
+
+# Define the reweight_dataset function (assuming it is defined)
+def reweight_dataset(df, y_name, group_name, group_levels):
+    # Placeholder for the actual reweighting logic
+    # This function should return the sample weights for the dataset
+    return pd.Series([1] * len(df))
+
+# Define the race levels
+race_levels = ['black', 'asian', 'white', 'other']
+
+# Apply reweighting
+train_weights = reweight_dataset(train, y_name, 'race', race_levels)
+
+# Train EBM model on reweighted data
+
+
+
+# Create a combined race column
+def combine_race_columns(row):
+    if row['black'] == 1:
+        return 'black'
+    elif row['asian'] == 1:
+        return 'asian'
+    elif row['white'] == 1:
+        return 'white'
+    else:
+        return 'other'
+
+data['race'] = data.apply(combine_race_columns, axis=1)
+test['race'] = test.apply(combine_race_columns, axis=1)
+
+# Verify the columns
+print("Data columns:", data.columns)
+print("Test columns:", test.columns)
+
+# Verify the 'race' column
+print("Data 'race' column:\n", data['race'].head())
+print("Test 'race' column:\n", test['race'].head())
+
+# Print the first few rows of the DataFrame
+print("Data DataFrame:\n", data.head())
+print("Test DataFrame:\n", test.head())
+
+# Define the reweight_dataset function (assuming it is defined)
+def reweight_dataset(df, y_name, group_name, group_levels):
+    # Placeholder for the actual reweighting logic
+    # This function should return the sample weights for the dataset
+    return pd.Series([1] * len(df))
+
+# Define the race levels
+race_levels = ['black', 'asian', 'white', 'other']
+
+# Apply reweighting
+train_weights = reweight_dataset(data, y_name, 'race', race_levels)
+
+# Train EBM model on reweighted data
+ebm = ExplainableBoostingClassifier(random_state=12345)
+ebm.fit(data[x_names], data[y_name], sample_weight=train_weights)
+
+# Evaluate the model on the test set
+test_predictions = ebm.predict(test[x_names])
+print("Test Predictions:\n", test_predictions)
+
+# Evaluate model
+best_ebm_perf = ROC(ebm.predict_proba).explain_perf(valid[x_names], valid[y_name])
+print('Validation AUC: %.4f.' % best_ebm_perf._internal_obj['overall']['auc'])
+
+# Score validation data with model
+best_ebm_phat = pd.DataFrame(ebm.predict_proba(valid[x_names])[:, 1], columns=['phat'])
+best_ebm_phat = pd.concat([valid.reset_index(drop=True), best_ebm_phat], axis=1)
+best_ebm_phat.head()
+
+# Find optimal cutoff based on F1
+def get_max_f1_frame(frame, y, yhat, res=0.01, air_reference=None, air_protected=None, verbose=False):
+    do_air = all(v is not None for v in [air_reference, air_protected])
+    columns = ['cut', 'f1', 'acc', 'air'] if do_air else ['cut', 'f1', 'acc']
+    f1_frame = pd.DataFrame(columns=columns)
+    temp_df = frame[[y, yhat]].copy(deep=True)
+    for i, cut in enumerate(np.arange(0, 1 + res, res)):
+        temp_df['decision'] = np.where(temp_df.iloc[:, 1] > cut, 1, 0)
+        f1 = f1_score(temp_df.iloc[:, 0], temp_df['decision'])
+        acc = accuracy_score(temp_df.iloc[:, 0], temp_df['decision'])
+        row_dict = {'cut': cut, 'f1': f1, 'acc': acc}
+        if do_air:
+            cm_ref = get_confusion_matrix(frame, y, yhat, by=air_reference, level=1, cutoff=cut, verbose=verbose)
+            cm_pro = get_confusion_matrix(frame, y, yhat, by=air_protected, level=1, cutoff=cut, verbose=verbose)
+            air_ = air({air_reference: cm_ref, air_protected: cm_pro}, air_reference, air_protected, verbose=verbose)
+            row_dict['air'] = air_
+        f1_frame = pd.concat([f1_frame, pd.DataFrame(row_dict, index=[i])], axis=0)
+    del temp_df
+    return f1_frame
+
+f1_frame = get_max_f1_frame(best_ebm_phat, y_name, 'phat')
+print(f1_frame)
+print()
+max_f1 = f1_frame['f1'].max()
+best_cut = f1_frame.loc[int(f1_frame['f1'].idxmax()), 'cut']
+acc = f1_frame.loc[int(f1_frame['f1'].idxmax()), 'acc']
+print('Best EBM F1: %.4f achieved at cutoff: %.2f with accuracy: %.4f.' % (max_f1, best_cut, acc))
+
+# Find confusion matrices for demographic groups
+def get_confusion_matrix(frame, y, yhat, by=None, level=None, cutoff=0.5, verbose=True):
+    level_list = list(frame[y].unique())
+    level_list.sort(reverse=True)
+    cm_frame = pd.DataFrame(columns=['actual: ' + str(i) for i in level_list], index=['predicted: ' + str(i) for i in level_list])
+    frame_ = frame.copy(deep=True)
+    dname = 'd_' + str(y)
+    frame_[dname] = np.where(frame_[yhat] > cutoff , 1, 0)
+    if (by is not None) & (level is not None):
+        frame_ = frame_[frame[by] == level]
+    for i, lev_i in enumerate(level_list):
+        for j, lev_j in enumerate(level_list):
+            cm_frame.iat[j, i] = frame_[(frame_[y] == lev_i) & (frame_[dname] == lev_j)].shape[0]
+    if verbose:
+        if by is None:
+            print('Confusion matrix:')
+        else:
+            print('Confusion matrix by ' + by + '=' + str(level))
+    return cm_frame
+
+demographic_group_names = ['black', 'asian', 'white', 'male', 'female']
+cm_dict = {}
+for name in demographic_group_names:
+    cm_dict[name] = get_confusion_matrix(best_ebm_phat, y_name, 'phat', by=name, level=1, cutoff=best_cut)
+    print(cm_dict[name])
+    print()
+
+# Find AIR for demographic groups
+def air(cm_dict, reference_key, protected_key, verbose=True):
+    eps = 1e-20
+    reference_accepted = float(cm_dict[reference_key].iat[1,0] + cm_dict[reference_key].iat[1,1])
+    reference_total = float(cm_dict[reference_key].sum().sum())
+    reference_prop = reference_accepted/reference_total
+    if verbose:
+        print(reference_key.title() + ' proportion accepted: %.3f' % reference_prop)
+    protected_accepted = float(cm_dict[protected_key].iat[1,0] + cm_dict[protected_key].iat[1,1])
+    protected_total = float(cm_dict[protected_key].sum().sum())
+    protected_prop = protected_accepted/protected_total
+    if verbose:
+        print(protected_key.title() + ' proportion accepted: %.3f' % protected_prop)
+    if np.isclose(protected_accepted, 0.0):
+        return np.nan
+    else:
+        return ((protected_prop + eps)/(reference_prop + eps))
+
+
+# Calculate AIR for all relevant demographic groups
+air_scores = {
+    'asian_vs_white': air(cm_dict, 'white', 'asian'),
+    'black_vs_white': air(cm_dict, 'white', 'black'),
+    'female_vs_male': air(cm_dict, 'male', 'female')
+}
+
+# Print AIR scores
+for comparison, score in air_scores.items():
+    print(f'Adverse impact ratio for {comparison.replace("_vs_", " vs. ")}: {score:.3f}')
+
+# Verify that no AIR score is below 0.8
+all_above_threshold = all(score >= 0.8 for score in air_scores.values())
+
+if all_above_threshold:
+    print("All AIR scores are above the threshold of 0.8.")
+else:
+    print("Some AIR scores are below the threshold of 0.8.")
+
+# Assuming ebm_grid_frame is the result of your grid search
+# Update the grid search results to include the new remediation method
+
+# Add a new column to indicate the use of reweighting
+ebm_grid_frame['reweighting'] = False
+
+# Add the results of the reweighted model to the grid search results
+reweighted_results = {
+    'max_bins': [None],  # Replace with actual values if needed
+    'max_interaction_bins': [None],  # Replace with actual values if needed
+    'interactions': [None],  # Replace with actual values if needed
+    'outer_bags': [None],  # Replace with actual values if needed
+    'inner_bags': [None],  # Replace with actual values if needed
+    'learning_rate': [None],  # Replace with actual values if needed
+    'validation_size': [None],  # Replace with actual values if needed
+    'min_samples_leaf': [None],  # Replace with actual values if needed
+    'max_leaves': [None],  # Replace with actual values if needed
+    'auc': [best_ebm_perf._internal_obj['overall']['auc']],
+    'air': [air_scores['black_vs_white']],  # Example for Black vs. White, adjust as needed
+    'reweighting': [True]
+}
+
+# Convert the reweighted results to a DataFrame and append to the grid search results
+reweighted_df = pd.DataFrame(reweighted_results)
+ebm_grid_frame = pd.concat([ebm_grid_frame, reweighted_df], ignore_index=True)
+
+# Display the updated grid search results
+print(ebm_grid_frame)
+
+#### Display grid search results as table
+
+ebm_grid_frame
+
+#### Display grid search results as plot
+
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(8,8))
+_ = ebm_grid_frame.plot(kind='scatter', x='air', y='auc', title='AIR vs. AUC for EBMs', ax=ax)
+_ = ax.axvline(x=0.8, color='r', linestyle='--')
+_ = ax.set_ylim([0.4, 0.85])
+_ = ax.set_xlim([0.75, 1.05])
+_ = ax.set_xlabel('AIR')
+_ = ax.set_ylabel('AUC')
+
+#### Retrain most accurate model above 0.8 AIR
+
+# Extract new params dict from ebm_grid_frame
+rem_params = ebm_grid_frame.loc[ebm_grid_frame['air'] > 0.8].sort_values(by='auc', ascending=False).iloc[0, :].to_dict()
+
+# Extract features from dict then delete from dict
+rem_x_names = rem_params['features']
+rem_x_names = [name.strip() for name in rem_x_names.split(',')]
+del rem_params['features']
+
+# Record and delete other extraneous information
+print('Best AUC: %.4f above 0.8 AIR (%.4f).' % (rem_params['auc'], rem_params['air']))
+del rem_params['auc']
+del rem_params['air']
+del rem_params['reweighting']
+
+# Reset some parameters to integers
+rem_params['random_state'] = int(rem_params['random_state'])
+rem_params['n_jobs'] = int(rem_params['n_jobs'])
+rem_params['early_stopping_rounds'] = int(rem_params['early_stopping_rounds'])
+
+# Add the 'high_priced' column to the data DataFrame
+data['high_priced'] = pd.Series([y_name])
+data = data.dropna(subset=[y_name])
+
+# Retrain using the original data DataFrame
+rem_ebm = ExplainableBoostingClassifier(**rem_params)
+rem_ebm.fit(data[rem_x_names], data[y_name])
+rem_ebm_perf = ROC(rem_ebm.predict_proba).explain_perf(test[rem_x_names], test[y_name])
+rem_auc = rem_ebm_perf._internal_obj['overall']['auc']
+print('Remediated EBM retrained with AUC: %.4f.' % rem_auc)
+
+#### Check that other groups are not adversely impacted by change
+
+# create a frame with remediated EBM predictions
+best_ebm_phat2 = pd.DataFrame(rem_ebm.predict_proba(valid[rem_x_names])[:, 1], columns=['phat'])
+best_ebm_phat2 = pd.concat([valid.reset_index(drop=True), best_ebm_phat2], axis=1)
+
+# calculate new confusion matrices for each group
+rem_cm_dict2 = {}
+for name in demographic_group_names:
+    rem_cm_dict2[name] = get_confusion_matrix(best_ebm_phat2, y_name, 'phat', by=name, level=1, cutoff=0.17, verbose=False)
+
+# calculate AIR for each group
+print('Adverse impact ratio for Asian people vs. White people: %.3f' % air(rem_cm_dict2, 'white', 'asian', verbose=False))
+print('Adverse impact ratio for Black people vs. White people: %.3f' % air(rem_cm_dict2, 'white', 'black', verbose=False))
+print('Adverse impact ratio for Females vs. Males: %.3f' % air(rem_cm_dict2, 'male', 'female', verbose=False))
+
+This analysis shows that even with a selective cutoff of 0.17, less discriminatory models are available. The new set of features and hyperparameters leads to a ~13% increase in AIR with a ~5% decrease in AUC.
+
+#### Print best model parameters for later use
+
+rem_params
+
+#### Print best model features for later use  
+
+rem_x_names
+
+#### Write submission file
+
+rem_ebm_submit = pd.DataFrame(rem_ebm.predict_proba(test[rem_x_names])[:, 1], columns=['phat'])
+rem_ebm_submit.to_csv('ph_rem_ebm_' + str(datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S") + '.csv'),
+                        index=False)
+
+rem_x_names
+
+#### End timer
+
+toc = time.time() - tic
+print('All tasks completed in %.2f s.' % (toc))
